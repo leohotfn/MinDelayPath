@@ -7,8 +7,10 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.controller import ofp_event
 from ryu.controller.handler import set_ev_cls
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
-from ryu.topology import event
+from ryu.topology import event, switches
 from ryu.lib.packet import packet, arp, ethernet, ipv4, ipv6, ether_types
+from ryu.base.app_manager import lookup_service_brick
+from ryu.lib import hub
 
 
 class MinDelayPathController(app_manager.RyuApp):
@@ -23,7 +25,13 @@ class MinDelayPathController(app_manager.RyuApp):
         # 相邻交换机节点，{s1: {s2: s1's-port-to-s1}, }
         self.switch_link_dict = {}
 
-        # 相邻交换机之间的链路往返延迟，{ s1: {s2: s1-to-s2-delay}, }
+        # lldp 延迟，{s1: {s2: controller-s1-s2-controller's delay }}
+        self.lldp_delay_dict = {}
+
+        # echo 报文延迟，{s1: controller-s1's delay}
+        self.echo_delay_dict = {}
+
+        # 相邻交换机之间的链路往返延迟，{ s1: {s2: s1-to-s2's delay}, }
         self.link_delay_dict = {}
 
         # 主机与交换机的连接信息，{host_mac: (datapath_id, datapath_in_port), }
@@ -31,6 +39,10 @@ class MinDelayPathController(app_manager.RyuApp):
 
         # 主机 IP 与 MAC 的映射关系，{host-ip: host-mac, }
         self.host_arp_dict = {}
+
+        self.switches_module = lookup_service_brick("switches")
+
+        self.detect_thread = hub.spawn(self.delay_detect_loop)
 
     def get_paths(self, src, dst):
         """
@@ -245,7 +257,7 @@ class MinDelayPathController(app_manager.RyuApp):
         eth_pkt = pkt.get_protocol(ethernet.ethernet)
         arp_pkt = pkt.get_protocol(arp.arp)
 
-        # TODO：不处理 LLDP 包？
+        # lldp 数据包在另外一个 handler 中处理
         if eth_pkt.ethertype == ether_types.ETH_TYPE_LLDP:
             return
 
@@ -300,3 +312,81 @@ class MinDelayPathController(app_manager.RyuApp):
             data=data
         )
         datapath.send_msg(out)
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def lldp_packet_in_handler(self, ev):
+        recv_timestamp = time.time()
+
+        if self.switches_module is None:
+            self.switches_module = lookup_service_brick("switches")
+        assert self.switches_module is not None
+
+        if not self.switches_module.link_discovery:
+            return
+
+        msg = ev.msg
+        try:
+            src_dpid, src_port_no = switches.LLDPPacket.lldp_parse(msg.data)
+            dst_dpid = msg.datapath.id
+
+            for port in self.switches_module.ports.keys():
+                if src_dpid == port.dpid and src_port_no == port.port_no:
+                    send_timestamp = self.switches_module.ports[port].timestamp
+
+                    self.lldp_delay_dict.setdefault(src_dpid, {})
+                    if send_timestamp:
+                        self.lldp_delay_dict[src_dpid][dst_dpid] = recv_timestamp - send_timestamp
+
+        except switches.LLDPPacket.LLDPUnknownFormat:
+            return
+
+    def send_echo_request(self):
+        for datapath in self.datapath_dict.itervalues():
+            ofp_parser = datapath.ofproto_parser
+            echo_req = ofp_parser.OFPEchoRequest(datapath, data="%.12f" % time.time())
+            datapath.send_msg(echo_req)
+
+    @set_ev_cls(ofp_event.EventOFPEchoReply, MAIN_DISPATCHER)
+    def echo_reply_handler(self, ev):
+        now_timestamp = time.time()
+        try:
+            delay = (now_timestamp - eval(ev.msg.data)) / 2
+            self.echo_delay_dict[ev.msg.datapath.id] = delay
+        except:
+            return
+
+    def delay_detect_loop(self):
+        while True:     # TODO：使用状态标志
+            self.send_echo_request()
+            self.calculate_delay()
+
+            for dp1 in self.link_delay_dict.keys():
+                for dp2 in self.link_delay_dict[dp1].keys():
+                    self.logger.info("DELAY %d ————> %d : %f", dp1, dp2, self.link_delay_dict[dp1][dp2])
+
+            hub.sleep(5)
+
+    def calculate_delay(self):
+        for dp1 in self.switch_link_dict.keys():
+            self.link_delay_dict.setdefault(dp1, {})
+
+            for dp2 in self.switch_link_dict[dp1].keys():
+                if dp1 == dp2:
+                    delay = 0
+                else:
+                    try:
+                        lldp_delay1 = self.lldp_delay_dict[dp1][dp2]
+                        lldp_delay2 = self.lldp_delay_dict[dp2][dp1]
+                        echo_delay1 = self.echo_delay_dict[dp1]
+                        echo_delay2 = self.echo_delay_dict[dp2]
+
+                        delay = (lldp_delay1 + lldp_delay2 - echo_delay1 - echo_delay2) / 2
+                        delay = max(delay, 0)
+                    except:
+                        # 若无延迟数据，则表明该路径可能不通
+                        delay = float("inf")
+
+                self.link_delay_dict[dp1][dp2] = delay
+
+
+
