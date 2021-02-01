@@ -42,7 +42,6 @@ from ryu.ofproto import ofproto_v1_4
 
 LOG = logging.getLogger(__name__)
 
-
 CONF = cfg.CONF
 
 CONF.register_cli_opts([

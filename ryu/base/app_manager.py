@@ -403,6 +403,8 @@ class AppManager(object):
         app_lists = [app for app
                      in itertools.chain.from_iterable(app.split(',')
                                                       for app in app_lists)]
+
+        cnt = 0
         while len(app_lists) > 0:
             app_cls_name = app_lists.pop(0)
 
