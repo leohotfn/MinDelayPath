@@ -16,6 +16,8 @@ from ryu.lib import hub
 class MinDelayPathController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
+    DELAY_DETECT_PERIOD = 5     # 延迟探测时间间隔，单位秒
+
     def __init__(self, *args, **kwargs):
         super(MinDelayPathController, self).__init__(*args, **kwargs)
 
@@ -133,12 +135,12 @@ class MinDelayPathController(app_manager.RyuApp):
         :param ip_dst: 目标主机 IP。
         :return: 延迟最低的路径上第一个交换机的输入端口。
         """
+        # 获取两两交换机之间的所有路径，并按照延迟排序
         paths_list = self.get_paths(src, dst)
-
+        paths_list.sort(key=lambda x: self.get_path_delay(x))
         paths_with_ports = self.add_ports_to_paths(paths_list, first_port, last_port)
-
-        # FIXME：1、需要判断 paths_list 不为空；2、后续使用延迟最低的路径
         optimal_path = paths_with_ports[0]
+
         for switch_id, ports in optimal_path.iteritems():
             datapath = self.datapath_dict[switch_id]
             ofp = datapath.ofproto
@@ -160,12 +162,12 @@ class MinDelayPathController(app_manager.RyuApp):
             actions = [
                 ofp_parser.OFPActionOutput(out_port)
             ]
-            self.add_flow(datapath, 32768, match_ip, actions)
-            self.add_flow(datapath, 1, match_arp, actions)
+            self.add_flow(datapath, 32768, match_ip, actions, hard_timeout=10)
+            self.add_flow(datapath, 1, match_arp, actions, hard_timeout=10)
 
         return optimal_path[src][1]
 
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None, idle_timeout=0, hard_timeout=0):
         """
         发送流表项到交换机 datapath 中。
         :param datapath: 目标交换机。
@@ -173,6 +175,8 @@ class MinDelayPathController(app_manager.RyuApp):
         :param match: 流表项的匹配域。
         :param actions: 流表项的执行动作。
         :param buffer_id: buffer ID。
+        :param idle_timeout:
+        :param hard_timeout:
         """
         ofp = datapath.ofproto
         ofp_parser = datapath.ofproto_parser
@@ -184,11 +188,14 @@ class MinDelayPathController(app_manager.RyuApp):
 
         if buffer_id:
             mod = ofp_parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                            priority=priority, match=match,
-                                            instructions=instructions)
+                                        priority=priority, match=match,
+                                        idle_timeout=idle_timeout, hard_timeout=hard_timeout,
+                                        instructions=instructions)
         else:
             mod = ofp_parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                            match=match, instructions=instructions)
+                                        match=match,
+                                        idle_timeout=idle_timeout, hard_timeout=hard_timeout,
+                                        instructions=instructions)
 
         datapath.send_msg(mod)
 
@@ -204,7 +211,6 @@ class MinDelayPathController(app_manager.RyuApp):
         if ev.state == MAIN_DISPATCHER:
             if datapath.id and datapath.id not in self.datapath_dict:
                 self.datapath_dict[datapath.id] = datapath
-            # TODO：其他成员变量，是否需要操作？
 
             # 添加 table-miss 流表项
             match_table_miss = ofp_parser.OFPMatch()
@@ -216,10 +222,20 @@ class MinDelayPathController(app_manager.RyuApp):
         elif ev.state == DEAD_DISPATCHER:
             if datapath.id in self.datapath_dict:
                 del self.datapath_dict[datapath.id]
-            # TODO：其他成员变量，是否需要操作？
+            if datapath.id in self.switch_link_dict:
+                del self.switch_link_dict[datapath.id]
+            if datapath.id in self.lldp_delay_dict:
+                del self.lldp_delay_dict[datapath.id]
+            if datapath.id in self.echo_delay_dict:
+                del self.echo_delay_dict[datapath.id]
+            if datapath.id in self.link_delay_dict:
+                del self.link_delay_dict[datapath.id]
 
     @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
     def link_add_handler(self, ev):
+        """
+        链路新增处理函数。
+        """
         s1 = ev.link.src
         s2 = ev.link.dst
 
@@ -232,6 +248,9 @@ class MinDelayPathController(app_manager.RyuApp):
 
     @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
     def link_delete_handler(self, ev):
+        """
+        链路删除处理函数。
+        """
         s1 = ev.link.src
         s2 = ev.link.dst
 
@@ -246,6 +265,9 @@ class MinDelayPathController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
+        """
+        packet-in 报文处理函数。
+        """
         msg = ev.msg
         datapath = msg.datapath
         datapath_id = datapath.id
@@ -269,6 +291,12 @@ class MinDelayPathController(app_manager.RyuApp):
 
         src_mac = eth_pkt.src
         dst_mac = eth_pkt.dst
+
+        self.logger.info("[packet_in_handler] datapath(ID:%d, port:%d), src:%s, dst:%s",
+                         datapath_id,
+                         in_port,
+                         src_mac,
+                         dst_mac)
 
         if src_mac not in self.hosts_dict:
             self.hosts_dict[src_mac] = (datapath_id, in_port)
@@ -315,6 +343,9 @@ class MinDelayPathController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def lldp_packet_in_handler(self, ev):
+        """
+        packet-in 报文处理函数。只处理 lldp 报文。
+        """
         recv_timestamp = time.time()
 
         if self.switches_module is None:
@@ -341,6 +372,9 @@ class MinDelayPathController(app_manager.RyuApp):
             return
 
     def send_echo_request(self):
+        """
+        对每个交换机发送 echo request 报文。
+        """
         for datapath in self.datapath_dict.itervalues():
             ofp_parser = datapath.ofproto_parser
             echo_req = ofp_parser.OFPEchoRequest(datapath, data="%.12f" % time.time())
@@ -348,6 +382,9 @@ class MinDelayPathController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPEchoReply, MAIN_DISPATCHER)
     def echo_reply_handler(self, ev):
+        """
+        echo-reply 报文处理函数。
+        """
         now_timestamp = time.time()
         try:
             delay = (now_timestamp - eval(ev.msg.data)) / 2
@@ -356,17 +393,38 @@ class MinDelayPathController(app_manager.RyuApp):
             return
 
     def delay_detect_loop(self):
-        while True:     # TODO：使用状态标志
+        """
+        延迟探测线程函数。
+        """
+        while self.is_active:
             self.send_echo_request()
             self.calculate_delay()
 
-            for dp1 in self.link_delay_dict.keys():
-                for dp2 in self.link_delay_dict[dp1].keys():
-                    self.logger.info("DELAY %d ————> %d : %f", dp1, dp2, self.link_delay_dict[dp1][dp2])
+            self.show_link_delay()
 
-            hub.sleep(5)
+            hub.sleep(MinDelayPathController.DELAY_DETECT_PERIOD)
+
+            # TODO：根据延迟，实时更新交换机的流表
+
+    def show_link_delay(self):
+        """
+        输出链路延迟到 log 中。
+        """
+        if not self.link_delay_dict:
+            return
+
+        show_msg = "----------switch link delay----------\n"
+        for dp1 in self.link_delay_dict.keys():
+            for dp2 in self.link_delay_dict[dp1].keys():
+                delay = self.link_delay_dict[dp1][dp2]
+                show_msg += "\t%d ————> %d : %.6f ms\n" % (dp1, dp2, delay * 1000)
+        show_msg += "-------------------------------------\n"
+        self.logger.info(show_msg)
 
     def calculate_delay(self):
+        """
+        计算交换机之间的延迟。
+        """
         for dp1 in self.switch_link_dict.keys():
             self.link_delay_dict.setdefault(dp1, {})
 
